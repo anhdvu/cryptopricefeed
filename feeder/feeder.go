@@ -2,6 +2,7 @@ package feeder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -14,7 +15,7 @@ import (
 
 var (
 	timeout         = 2 * time.Minute
-	defaultInterval = 1 * time.Minute
+	defaultInterval = 30 * time.Second
 )
 
 // Manager represents a collection of crypto price feeders
@@ -49,28 +50,34 @@ func NewWithInterval(t time.Duration) *Manager {
 	return m
 }
 
+// Run acts as main entrypoint
 func (m *Manager) Run() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var pschannels []string
+	var err error
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	pschannels, err := m.r.PubSubChannels(ctx, "pair*").Result()
-	if err != nil {
-		return err
-	}
+	for {
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
 
-	for _, channel := range pschannels {
-		if _, ok := m.feeders[channel]; !ok {
-			feeder, err := m.spawnFeeder(channel)
-			if err != nil {
-				return err
-			}
-			m.feeders[channel] = feeder
+		pschannels, err = m.r.PubSubChannels(ctx, "pair*").Result()
+		if err != nil {
+			return err
 		}
-	}
 
-	return nil
+		m.mu.Lock()
+		for _, channel := range pschannels {
+			if _, ok := m.feeders[channel]; !ok {
+				feeder, err := m.spawnFeeder(channel)
+				if err != nil {
+					return err
+				}
+				m.feeders[channel] = feeder
+			}
+		}
+		m.mu.Unlock()
+	}
 }
 
 func (m *Manager) startCleanup(interval time.Duration) {
@@ -93,11 +100,14 @@ func (m *Manager) startCleanup(interval time.Duration) {
 func (m *Manager) removeStale() {
 	m.mu.Lock()
 	for symbol, feeder := range m.feeders {
+		feeder.mu.Lock()
 		if time.Since(feeder.lastPublishSuccess) > 1*time.Minute {
 			feeder.close <- true
+			log.Printf("signaled to close stale feeder %s", feeder.symbol)
 			delete(m.feeders, symbol)
-			log.Printf("stale feeder %s has been removed", feeder.symbol)
+			log.Printf("removed stale feeder %s", feeder.symbol)
 		}
+		feeder.mu.Unlock()
 	}
 	m.mu.Unlock()
 }
@@ -108,6 +118,7 @@ type feeder struct {
 	c                  *websocket.Conn
 	lastPublishSuccess time.Time
 	close              chan bool
+	disconnected       bool
 	symbol             string
 	price              chan string
 }
@@ -158,7 +169,12 @@ func (f *feeder) start() {
 		for {
 			_, message, err := f.c.ReadMessage()
 			if err != nil {
-				log.Printf("error %v\nreturning to the caller...", err)
+				switch {
+				case errors.Is(err, websocket.ErrCloseSent):
+					log.Printf("")
+				default:
+					log.Printf("%v\nreturning to the caller...", err)
+				}
 				return
 			}
 			f.price <- string(message)
@@ -173,6 +189,7 @@ func (f *feeder) start() {
 			if err != nil {
 				log.Println(err)
 			}
+			f.disconnected = true
 			close(f.price)
 			return
 		case <-time.After(timeout):
@@ -181,6 +198,7 @@ func (f *feeder) start() {
 			if err != nil {
 				log.Println(err)
 			}
+			f.disconnected = true
 			return
 		case price := <-f.price:
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -189,10 +207,11 @@ func (f *feeder) start() {
 			if err != nil {
 				log.Println(err)
 			}
-
+			f.mu.Lock()
 			if result > 0 {
 				f.lastPublishSuccess = time.Now()
 			}
+			f.mu.Unlock()
 		}
 	}
 }

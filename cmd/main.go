@@ -7,12 +7,9 @@ import (
 )
 
 func main() {
-	done := make(chan bool)
 	man := feeder.New()
 	err := man.Run()
 	if err != nil {
 		log.Println(err)
 	}
-
-	<-done
 }
